@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: shopee-research
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/research/health
+    envVars:
+      - key: AUTH_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: NODE_VERSION
+        value: "20"

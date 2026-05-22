@@ -1,0 +1,21 @@
+{
+  "name": "shopee-research-cloud",
+  "version": "1.0.0",
+  "description": "Shopee 调研工具云端精简版（Render 托管）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.0",
+    "undici": "^8.3.0",
+    "uuid": "^10.0.0"
+  }
+}
