@@ -43,7 +43,7 @@ router.use((req, res, next) => {
 
 router.post('/export', async (req, res) => {
   try {
-    const { items: rawItems = [], skus: rawSkus = [], ratings: rawRatings = [], keyword = '', filters = null } = req.body || {};
+    const { items: rawItems = [], skus: rawSkus = [], ratings: rawRatings = [], keyword = '', filters = null, analyzeVisuals = false } = req.body || {};
 
     if (!rawItems.length && !rawSkus.length && !rawRatings.length) {
       return res.json({ ok: false, error: '没有采集到数据，先在站斧浏览器里浏览 Shopee 商品页' });
@@ -190,10 +190,48 @@ router.post('/export', async (req, res) => {
     ws3.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
     ws3.getColumn('comment').alignment = { wrapText: true, vertical: 'top' };
 
-    // Sheet 4 — 调研报告（统计 + LLM 主题聚类）
+    // Sheet 4 — 竞品图片（主图可点击 URL + 详情长图 + 文字详情）
+    const ws4img = wb.addWorksheet('竞品图片');
+    ws4img.columns = [
+      { header: '商品 ID', key: 'itemid', width: 16 },
+      { header: '商品标题', key: 'title', width: 44 },
+      { header: '月销', key: 'monthlySold', width: 8 },
+      { header: '主图1', key: 'main1', width: 16 },
+      { header: '主图2', key: 'main2', width: 16 },
+      { header: '主图3', key: 'main3', width: 16 },
+      { header: '有长图', key: 'hasLong', width: 8 },
+      { header: '详情长图链接（| 分隔）', key: 'longImages', width: 40 },
+      { header: '文字详情（截断）', key: 'descText', width: 60 },
+    ];
+    const linkCell = (url) => (url ? { text: '点击查看', hyperlink: url } : '');
+    for (const it of items) {
+      const mains = Array.isArray(it.mainImages) ? it.mainImages : [];
+      const longs = Array.isArray(it.longImages) ? it.longImages : [];
+      const row = ws4img.addRow({
+        itemid: it.itemid,
+        title: it.title || '',
+        monthlySold: it.monthlySold ?? '',
+        main1: linkCell(mains[0]),
+        main2: linkCell(mains[1]),
+        main3: linkCell(mains[2]),
+        hasLong: it.hasLongImage ? '是' : '否',
+        longImages: longs.join(' | '),
+        descText: it.descText || '',
+      });
+      // 超链接单元格上蓝色下划线
+      ['main1', 'main2', 'main3'].forEach((k) => {
+        const c = row.getCell(k);
+        if (c.value && typeof c.value === 'object') c.font = { color: { argb: 'FF0563C1' }, underline: true };
+      });
+    }
+    ws4img.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEE4D2D' } };
+    ws4img.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    ws4img.getColumn('descText').alignment = { wrapText: true, vertical: 'top' };
+
+    // Sheet 5 — 调研报告（统计 + LLM 主题聚类）
     let reportError = null;
     try {
-      const report = await generateResearchReport({ keyword, items, skus, ratings });
+      const report = await generateResearchReport({ keyword, items, skus, ratings, analyzeVisuals });
       const ws4 = wb.addWorksheet('调研报告');
       ws4.columns = [
         { header: '维度', key: 'k', width: 22 },
@@ -360,6 +398,49 @@ router.post('/export', async (req, res) => {
       } else if (report.llmReport?._parseError) {
         addSection('━━ LLM 输出解析失败 ━━');
         ws4.addRow({ k: '原始输出（截断）', v: (report.llmReport._raw || '').slice(0, 4000) });
+      }
+
+      // Sheet 6 — 竞品视觉卖点拆解（仅当 analyzeVisuals 开启时生成）
+      if (analyzeVisuals) {
+        const ws6 = wb.addWorksheet('竞品视觉卖点拆解');
+        ws6.columns = [
+          { header: '维度', key: 'k', width: 22 },
+          { header: '内容', key: 'v', width: 100 },
+        ];
+        ws6.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEE4D2D' } };
+        ws6.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        ws6.getColumn('v').alignment = { wrapText: true, vertical: 'top' };
+        const addSec6 = (title) => {
+          const row = ws6.addRow({ k: title, v: '' });
+          row.font = { bold: true };
+          row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF5F0' } };
+        };
+        const va = report.visualAnalysis;
+        if (report.visualError) {
+          addSec6('━━ 视觉拆解失败 ━━');
+          ws6.addRow({ k: '原因', v: report.visualError });
+        } else if (!va || !va.analyzed?.length) {
+          addSec6('━━ 未生成视觉拆解 ━━');
+          ws6.addRow({ k: '说明', v: va?.note || '没有采到带主图的竞品。需在 Shopee 商品详情页停留，让扩展抓到 product_images 后再导出。' });
+        } else {
+          ws6.addRow({ k: '说明', v: `按月销取 Top${va.sampledCount} 竞品，喂 Gemini 2.5 Flash 多模态分析主图+详情图。每个竞品 ≤6 张图。` }).font = { italic: true };
+          va.analyzed.forEach((c, i) => {
+            addSec6(`━━ 竞品#${i + 1}：${c.title || c.itemid}（月销 ${c.monthlySold ?? '?'}｜${c.imgCount ?? 0} 图） ━━`);
+            if (c.error) {
+              ws6.addRow({ k: '分析失败', v: c.error });
+              return;
+            }
+            if (c._raw) {
+              ws6.addRow({ k: '原始输出（解析失败）', v: c._raw });
+              return;
+            }
+            ws6.addRow({ k: '主图卖点', v: c.mainImageSellingPoints || '' });
+            ws6.addRow({ k: '场景/道具', v: c.sceneAndProps || '' });
+            ws6.addRow({ k: '详情重点', v: c.detailFocus || '' });
+            ws6.addRow({ k: '视觉亮点（可借鉴）', v: (c.visualStrengths || []).map((x) => `· ${x}`).join('\n') });
+            ws6.addRow({ k: '视觉空白（可差异化）', v: (c.visualGaps || []).map((x) => `· ${x}`).join('\n') });
+          });
+        }
       }
     } catch (e) {
       console.error('Research report generation error:', e);

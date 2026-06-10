@@ -540,7 +540,116 @@ ${reviews.bad.map((c, i) => `${i + 1}. ${c}`).join('\n')}
   }
 }
 
-export async function generateResearchReport({ keyword, items, skus, ratings }) {
+// ============ 竞品视觉拆解（多模态，opt-in）============
+// 拉竞品主图/详情图 → 喂 Gemini 2.5 Flash 一次看完一个竞品的图，输出结构化卖点拆解。
+// 成本敏感：只取月销 Top N，每个竞品 ≤6 张图，并发受限。
+
+async function fetchImageAsBase64(url, timeoutMs = 15000) {
+  let timer;
+  const ac = new AbortController();
+  timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || 'image/jpeg';
+    if (!/^image\//i.test(ct)) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length || buf.length > 6 * 1024 * 1024) return null; // 跳过空图/超 6MB
+    return { mimeType: ct.split(';')[0], data: buf.toString('base64') };
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 一个竞品：按 has_long_image 分流取图（有长图=主3+长图前2末1；没长图=主3 + 喂文字详情）
+function pickVisualSources(it) {
+  const mains = (Array.isArray(it.mainImages) ? it.mainImages : []).slice(0, 3);
+  const longs = Array.isArray(it.longImages) ? it.longImages : [];
+  let detailImgs = [];
+  if (it.hasLongImage && longs.length) {
+    if (longs.length <= 3) detailImgs = longs.slice();
+    else detailImgs = [longs[0], longs[1], longs[longs.length - 1]]; // 前2末1
+  }
+  return { mains, detailImgs, descText: it.hasLongImage ? '' : (it.descText || '') };
+}
+
+async function analyzeOneCompetitor(it, market) {
+  const { mains, detailImgs, descText } = pickVisualSources(it);
+  const urls = [...mains, ...detailImgs];
+  if (!urls.length) return null;
+
+  const imgs = (await Promise.all(urls.map((u) => fetchImageAsBase64(u)))).filter(Boolean);
+  if (!imgs.length) return { itemid: it.itemid, title: it.title, error: '图片全部拉取失败' };
+
+  const labelLines = [];
+  let idx = 0;
+  for (let i = 0; i < mains.length && idx < imgs.length; i++, idx++) labelLines.push(`图${idx + 1}=主图${i + 1}`);
+  for (let i = 0; i < detailImgs.length && idx < imgs.length; i++, idx++) labelLines.push(`图${idx + 1}=详情长图`);
+
+  const prompt = `你是跨境电商视觉营销分析师。下面是 ${market.country} Shopee 一个竞品"${it.title || ''}"（月销 ${it.monthlySold ?? '未知'}）的商品图片，按顺序：
+${labelLines.join('；')}
+${descText ? `\n该商品详情为纯文字（无长图），文字详情如下（截断）：\n${descText.slice(0, 1500)}` : ''}
+
+请只基于图片（和提供的文字）拆解这个竞品的视觉打法，返回严格 JSON（不要 markdown 围栏，字段名完全一致）：
+{
+  "mainImageSellingPoints": "主图（轮播首图+前几张）打的核心卖点是什么：放了哪些利益点文案/参数/场景，第一张主图靠什么抓眼球",
+  "sceneAndProps": "侧图/场景图呈现的使用场景、人物、道具、拍摄风格（如纯白底/场景实拍/模特佩戴）",
+  "detailFocus": "详情部分（长图或文字）重点讲了什么：功能演示、参数对比、痛点解决、信任背书等",
+  "visualStrengths": ["这个竞品视觉上做得好的 2-3 点（可借鉴）"],
+  "visualGaps": ["视觉上的薄弱/空白点 1-2 点（我方可差异化突破）"]
+}`;
+
+  const parts = [{ text: prompt }, ...imgs.map((im) => ({ inlineData: { mimeType: im.mimeType, data: im.data } }))];
+
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Gemini 视觉调用超时')), 90_000); });
+  let response;
+  try {
+    response = await Promise.race([
+      ai.models.generateContent({ model: 'gemini-2.5-flash', contents: [{ role: 'user', parts }] }),
+      timeout,
+    ]);
+  } catch (e) {
+    return { itemid: it.itemid, title: it.title, imgCount: imgs.length, error: e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const text = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const jsonStr = m ? m[1].trim() : text.trim();
+  let parsed;
+  try { parsed = JSON.parse(jsonStr); } catch (e) { parsed = { _raw: text.slice(0, 1500) }; }
+  return { itemid: it.itemid, title: it.title, monthlySold: it.monthlySold, imgCount: imgs.length, ...parsed };
+}
+
+// 并发受限跑一批
+async function analyzeCompetitorVisuals(items, market, { topN = 8, concurrency = 3 } = {}) {
+  await ensureProxyDispatcher();
+  // 只挑有主图、按月销排序的 Top N
+  const withImg = items
+    .filter((it) => Array.isArray(it.mainImages) && it.mainImages.length)
+    .map((it) => ({ ...it, _m: toNum(it.monthlySold) ?? 0 }))
+    .sort((a, b) => b._m - a._m)
+    .slice(0, topN);
+  if (!withImg.length) return { analyzed: [], note: '没有采到带主图的竞品（需在 Shopee 商品详情页停留让扩展抓到 product_images）' };
+
+  const tasks = withImg.map((it) => () => analyzeOneCompetitor(it, market));
+  const results = [];
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+    while (cursor < tasks.length) {
+      const i = cursor++;
+      results[i] = await tasks[i]();
+    }
+  });
+  await Promise.all(workers);
+  return { analyzed: results.filter(Boolean), sampledCount: withImg.length };
+}
+
+export async function generateResearchReport({ keyword, items, skus, ratings, analyzeVisuals = false }) {
   const market = detectMarket(items);
   const priceBucket = bucketByPrice(items);
   const top = topSellers(items, 10);
@@ -577,6 +686,17 @@ export async function generateResearchReport({ keyword, items, skus, ratings }) 
     llmError = `评论样本太少（好评 ${picked.good.length} + 差评 ${picked.bad.length}），跳过 LLM 主题聚类。继续浏览更多商品评论页可改善。`;
   }
 
+  // 竞品视觉拆解：opt-in 才跑（多模态调用烧额度，只取月销 Top6）
+  let visualAnalysis = null;
+  let visualError = null;
+  if (analyzeVisuals) {
+    try {
+      visualAnalysis = await analyzeCompetitorVisuals(items, market, { topN: 6, concurrency: 3 });
+    } catch (e) {
+      visualError = e.message;
+    }
+  }
+
   return {
     keyword: keyword || '',
     generatedAt: new Date().toISOString(),
@@ -600,5 +720,7 @@ export async function generateResearchReport({ keyword, items, skus, ratings }) 
     reviewClusters,
     llmReport,
     llmError,
+    visualAnalysis,
+    visualError,
   };
 }
