@@ -423,7 +423,7 @@ router.post('/export', async (req, res) => {
           addSec6('━━ 未生成视觉拆解 ━━');
           ws6.addRow({ k: '说明', v: va?.note || '没有采到带主图的竞品。需在 Shopee 商品详情页停留，让扩展抓到 product_images 后再导出。' });
         } else {
-          ws6.addRow({ k: '说明', v: `按月销取 Top${va.sampledCount} 竞品，喂 Gemini 2.5 Flash 多模态分析主图+详情图。每个竞品 ≤6 张图。` }).font = { italic: true };
+          ws6.addRow({ k: '说明', v: `按月销取 Top${va.sampledCount} 竞品，喂 Gemini 2.5 Flash 多模态分析主图+详情图。每个竞品 ≤6 张图。${va.note ? '\n⚠ ' + va.note : ''}` }).font = { italic: true };
           va.analyzed.forEach((c, i) => {
             addSec6(`━━ 竞品#${i + 1}：${c.title || c.itemid}（月销 ${c.monthlySold ?? '?'}｜${c.imgCount ?? 0} 图） ━━`);
             if (c.error) {

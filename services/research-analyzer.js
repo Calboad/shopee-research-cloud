@@ -625,9 +625,10 @@ ${descText ? `\n该商品详情为纯文字（无长图），文字详情如下�
   return { itemid: it.itemid, title: it.title, monthlySold: it.monthlySold, imgCount: imgs.length, ...parsed };
 }
 
-// 并发受限跑一批
-async function analyzeCompetitorVisuals(items, market, { topN = 8, concurrency = 3 } = {}) {
+// 并发受限跑一批 + 时间预算兜底
+async function analyzeCompetitorVisuals(items, market, { topN = 6, concurrency = 3, budgetMs = 60000 } = {}) {
   await ensureProxyDispatcher();
+  const startedAt = Date.now();
   // 只挑有主图、按月销排序的 Top N
   const withImg = items
     .filter((it) => Array.isArray(it.mainImages) && it.mainImages.length)
@@ -636,17 +637,26 @@ async function analyzeCompetitorVisuals(items, market, { topN = 8, concurrency =
     .slice(0, topN);
   if (!withImg.length) return { analyzed: [], note: '没有采到带主图的竞品（需在 Shopee 商品详情页停留让扩展抓到 product_images）' };
 
-  const tasks = withImg.map((it) => () => analyzeOneCompetitor(it, market));
+  // 时间预算兜底：每取下一个竞品前看时钟，过了 budgetMs 就不再发起新调用（已在跑的不掐断），
+  // 返回已拆完的 + 跳过数。配合外层文字 LLM 并行，保证 Render 100s 内一定返回，永不 504。
   const results = [];
   let cursor = 0;
-  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
-    while (cursor < tasks.length) {
+  let skipped = 0;
+  const workers = Array.from({ length: Math.min(concurrency, withImg.length) }, async () => {
+    while (cursor < withImg.length) {
       const i = cursor++;
-      results[i] = await tasks[i]();
+      if (Date.now() - startedAt > budgetMs) { skipped++; continue; }
+      results[i] = await analyzeOneCompetitor(withImg[i], market);
     }
   });
   await Promise.all(workers);
-  return { analyzed: results.filter(Boolean), sampledCount: withImg.length };
+  const analyzed = results.filter(Boolean);
+  return {
+    analyzed,
+    sampledCount: withImg.length,
+    skipped,
+    note: skipped ? `时间预算 ${Math.round(budgetMs / 1000)}s 到，已拆解 ${analyzed.length} 个、跳过 ${skipped} 个（可减少一次导出的竞品数）` : undefined,
+  };
 }
 
 export async function generateResearchReport({ keyword, items, skus, ratings, analyzeVisuals = false }) {
@@ -663,9 +673,18 @@ export async function generateResearchReport({ keyword, items, skus, ratings, an
   // 纯 JS 聚类必跑：LLM 失败时是主力，成功时是数据校验
   const reviewClusters = pureJsReviewClusters(ratings);
 
+  // 文字 LLM 报告 与 竞品视觉拆解 互不依赖 → 并行跑，墙钟取两者较大值而非累加，
+  // 把 Top6 满载压进 Render 100s 安全区。各自 try/catch 隔离，一个挂不影响另一个。
   let llmReport = null;
   let llmError = null;
-  if (picked.good.length + picked.bad.length >= 4) {
+  let visualAnalysis = null;
+  let visualError = null;
+
+  const llmTask = (async () => {
+    if (picked.good.length + picked.bad.length < 4) {
+      llmError = `评论样本太少（好评 ${picked.good.length} + 差评 ${picked.bad.length}），跳过 LLM 主题聚类。继续浏览更多商品评论页可改善。`;
+      return;
+    }
     try {
       llmReport = await llmThemesAndAdvice({
         keyword,
@@ -682,20 +701,19 @@ export async function generateResearchReport({ keyword, items, skus, ratings, an
     } catch (e) {
       llmError = e.message;
     }
-  } else {
-    llmError = `评论样本太少（好评 ${picked.good.length} + 差评 ${picked.bad.length}），跳过 LLM 主题聚类。继续浏览更多商品评论页可改善。`;
-  }
+  })();
 
-  // 竞品视觉拆解：opt-in 才跑（多模态调用烧额度，只取月销 Top6）
-  let visualAnalysis = null;
-  let visualError = null;
-  if (analyzeVisuals) {
+  // 竞品视觉拆解：opt-in 才跑（多模态调用烧额度，只取月销 Top6，带时间预算兜底）
+  const visualTask = (async () => {
+    if (!analyzeVisuals) return;
     try {
       visualAnalysis = await analyzeCompetitorVisuals(items, market, { topN: 6, concurrency: 3 });
     } catch (e) {
       visualError = e.message;
     }
-  }
+  })();
+
+  await Promise.all([llmTask, visualTask]);
 
   return {
     keyword: keyword || '',
